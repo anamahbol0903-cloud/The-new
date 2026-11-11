@@ -1,4 +1,4 @@
-name: Build CanProbe
+name: Build CanProbe v2
 on:
   workflow_dispatch:
   push:
@@ -77,6 +77,7 @@ jobs:
             android:accessibilityFeedbackType="feedbackGeneric"
             android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
             android:canRetrieveWindowContent="true"
+            android:canTakeScreenshot="true"
             android:notificationTimeout="100"
             android:description="@string/d"/>
           EOF_FILE
@@ -115,10 +116,11 @@ jobs:
             )
             @Volatile var step = -1
             @Volatile var running = false
+            @Volatile var info = ""
             val log = ArrayList<Triple<Int, String, String>>()
             var prev: Map<String, String> = HashMap()
             val seen = HashSet<String>()
-            val rx = Regex("\\bcan\\b|canbus|canservice|door|rev:|rzc|raise|syu|mcu|hcn|cem|autocan", RegexOption.IGNORE_CASE)
+            val rx = Regex("\\bcan\\b|canbus|canservice|door|rev:|rzc|raise|syu|mcu|hcn|cem|autocan|clw|carletter|imotor|vehicle|reserve", RegexOption.IGNORE_CASE)
 
             fun add(s: Int, k: String, v: String) {
               synchronized(log) { log.add(Triple(s, k, v)) }
@@ -151,10 +153,10 @@ jobs:
 
             fun readLogcat(st: Int) {
               try {
-                val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "brief", "-t", "300"))
+                val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", "400"))
                 var n = 0
                 p.inputStream.bufferedReader().forEachLine { l ->
-                  if (n < 20 && rx.containsMatchIn(l) && seen.add(l.take(220))) {
+                  if (n < 30 && rx.containsMatchIn(l) && seen.add(l.take(220))) {
                     add(st, "LOG", l.take(160))
                     n++
                   }
@@ -193,6 +195,7 @@ jobs:
 
             fun report(): String {
               val sb = StringBuilder()
+              sb.append(info).append("\n")
               sb.append("Android ").append(Build.VERSION.RELEASE).append(" / ").append(Build.MODEL).append(" / ").append(Build.DISPLAY).append("\n")
               val cnt = HashMap<String, Int>()
               val rows = synchronized(log) { ArrayList(log) }
@@ -224,14 +227,24 @@ jobs:
 
           import android.accessibilityservice.AccessibilityService
           import android.content.Intent
+          import android.graphics.Bitmap
           import android.graphics.Rect
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
+          import java.io.File
+          import java.io.FileOutputStream
 
           class ProbeService : AccessibilityService() {
             companion object {
               @Volatile var inst: ProbeService? = null
             }
+
+            private val h = Handler(Looper.getMainLooper())
+            private var shotN = 0
+            private var lastBurst = 0L
 
             override fun onServiceConnected() {
               inst = this
@@ -244,7 +257,49 @@ jobs:
 
             override fun onAccessibilityEvent(e: AccessibilityEvent?) {
               if (e != null && e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && Probe.step > 0) {
-                Probe.add(Probe.step, "EVT", (e.packageName?.toString() ?: "?") + "/" + (e.className?.toString() ?: "?"))
+                val pkg = e.packageName?.toString() ?: "?"
+                Probe.add(Probe.step, "EVT", pkg + "/" + (e.className?.toString() ?: "?"))
+                if (pkg == "com.clw.vehicleinfos") burst(Probe.step)
+              }
+            }
+
+            // la fenetre portes de l'appli du poste reste affichee peu de temps : 3 captures rapprochees
+            private fun burst(step: Int) {
+              val now = System.currentTimeMillis()
+              if (now - lastBurst < 3000) return
+              lastBurst = now
+              for (d in longArrayOf(0L, 500L, 1500L)) h.postDelayed({ shot(step) }, d)
+            }
+
+            private fun shot(step: Int) {
+              if (Build.VERSION.SDK_INT < 30) { Probe.add(step, "SHOT", "Android < 11 : pas de capture"); return }
+              try {
+                takeScreenshot(0, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
+                  override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                    try {
+                      val hb = r.hardwareBuffer
+                      val hw = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)
+                      if (hw != null) {
+                        val bmp = hw.copy(Bitmap.Config.ARGB_8888, false)
+                        val dir = File(getExternalFilesDir(null), "shots")
+                        dir.mkdirs()
+                        shotN++
+                        val f = File(dir, "step" + step + "_" + shotN + ".png")
+                        FileOutputStream(f).use { o -> bmp.compress(Bitmap.CompressFormat.PNG, 100, o) }
+                        Probe.add(step, "SHOT", f.name)
+                      }
+                      hb.close()
+                    } catch (ex: Exception) {
+                      Probe.add(step, "SHOT", "erreur " + ex)
+                    }
+                  }
+
+                  override fun onFailure(code: Int) {
+                    Probe.add(step, "SHOT", "echec code " + code)
+                  }
+                })
+              } catch (ex: Throwable) {
+                Probe.add(step, "SHOT", "exception " + ex)
               }
             }
 
@@ -339,6 +394,7 @@ jobs:
             private fun next() {
               if (Probe.step < 0) {
                 Probe.step = 0
+                Probe.info = "V2 acc=" + (ProbeService.inst != null) + " logs=" + (packageManager.checkPermission("android.permission.READ_LOGS", packageName) == PackageManager.PERMISSION_GRANTED)
                 Probe.start(applicationContext)
               } else if (Probe.step < Probe.steps.size - 1) {
                 Probe.step = Probe.step + 1
@@ -348,7 +404,7 @@ jobs:
                 out.text = r
                 Probe.save(this, r)
                 share.visibility = View.VISIBLE
-                info.text = "Terminé. Fais défiler le rapport et prends des captures d'écran. Fichier : Téléchargements/canprobe.txt"
+                info.text = "Terminé. Fais défiler le rapport et prends des captures d'écran. Captures : adb pull /sdcard/Android/data/com.fouad.canprobe/files/shots"
                 btn.visibility = View.GONE
                 done = true
                 return
